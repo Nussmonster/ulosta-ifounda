@@ -7,6 +7,8 @@ liquidity (LP) positions in Nomadex pools. Read-only.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -96,13 +98,33 @@ def main() -> int:
     held = {p: b for p, b in bal.items() if b > 0}
     if not held:
         print("  none")
+    pool_scanner = ps.Scanner(idx, 90, 0, reader, [], False, nmx, last_seen=False)
     for pid, lp in held.items():
         app = ps.call(idx.applications, pid)["application"]
         st = ps.decode_global_state(app)
-        supply = ps.state_uint(st.get("total_supply")) or 0
         dec = ps.state_uint(st.get("decimals")) or 6
-        share = lp / supply * 100 if supply else 0
-        print(f"  pool {pid}: LP {ps.fmt_amount(lp, dec)} of {ps.fmt_amount(supply, dec)} ({share:.4f}% of pool)")
+        # total_supply is the fixed maximum; LP the pool still holds itself is not issued.
+        max_supply = ps.state_uint(st.get("total_supply")) or 0
+        escrow = ps.get_application_address(pid)
+        unissued = reader.balances([pid], holder=escrow, sender=addr).get(pid, 0)
+        outstanding = max_supply - unissued
+        share = lp / outstanding if outstanding > 0 else 0
+        print(f"\n  pool {pid}: LP {ps.fmt_amount(lp, dec)} of {ps.fmt_amount(outstanding, dec)} outstanding "
+              f"= {share * 100:.4f}% of the pool")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            info = pool_scanner.check_pool(pid)
+        if not info:
+            print("    (pool details unavailable)")
+            continue
+        pair = " / ".join(f"{t['symbol']} ({t['kind']})" for t in info.get("pair", []))
+        print(f"    pair {pair}, fee {info.get('fee_percent')}%, "
+              f"{'INACTIVE' if info['inactive'] else 'active'}; "
+              f"last app call {(info.get('last_app_call') or {}).get('time', 'not found')}")
+        for h in info["balances"]:
+            mine = int(h["amount"] * share)
+            print(f"    {h['unit']:<10} pool {ps.fmt_amount(h['amount'], h['decimals'])}"
+                  f"  -> your share {ps.fmt_amount(mine, h['decimals'])}")
     for c in created:
         if c["id"] in pools:
             print(f"  (created Nomadex pool {c['id']})")
