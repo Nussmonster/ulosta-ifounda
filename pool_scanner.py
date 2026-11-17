@@ -18,7 +18,7 @@ Balances checked per pool escrow:
     app IDs found in the pool's global state that answer the ARC-200 interface.
 
 Nomadex pools (global state "factory" == Nomadex factory app) are recognised automatically:
-their token pair is looked up in the Mimir API (falling back to global-state keys), ARC-200 legs
+their token pair is read from the pool's alpha_*/beta_* state (Mimir API as fallback), ARC-200 legs
 are read via simulate, and the pair and fee are reported. --nomadex lists all factory pools.
 """
 
@@ -47,6 +47,12 @@ API_TOKEN = ""  # empty for the public Nodely free tier
 NOMADEX_FACTORY = 411751  # Nomadex factory app on Voi mainnet
 MIMIR_URL = "https://voi-mainnet-mimirapi.nftnavigator.xyz"
 NOMADEX_FEE_SCALE = 10 ** 14  # swap_fee / platform_fee are uint256 fractions of 1e14
+NOMADEX_TOKEN_TYPES = {0: "native", 1: "asa", 2: "arc200"}  # pool alpha_type / beta_type byte
+CHAIN_START = datetime(2024, 9, 1, tzinfo=timezone.utc)  # before Voi mainnet launch; history-search floor
+
+
+def iso(t: datetime) -> str:
+    return t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 # Placeholder app IDs -- replace with real pool app IDs from an explorer / pool registry.
 KNOWN_POOLS = [
@@ -224,9 +230,6 @@ def state_uint(value) -> int | None:
 class Nomadex:
     """Nomadex-specific lookups: factory pool listing, token pair, fees."""
 
-    TOKEN_KEYS = (("tok_a", "tokA", "token_a", "tokenA", "token0", "token_0"),
-                  ("tok_b", "tokB", "token_b", "tokenB", "token1", "token_1"))
-
     def __init__(self, client: indexer.IndexerClient, factory: int, mimir_url: str | None):
         self.client = client
         self.factory = factory
@@ -259,11 +262,12 @@ class Nomadex:
                 self._platform_fee = 0
         return self._platform_fee
 
-    def fee_percent(self, state: dict) -> float | None:
+    def fees_percent(self, state: dict) -> tuple[float, float] | None:
+        """(pool swap fee %, factory platform fee %). A swap pays both."""
         swap_fee = state_uint(state.get("swap_fee"))
         if swap_fee is None:
             return None
-        return (swap_fee + self.platform_fee()) * 100 / NOMADEX_FEE_SCALE
+        return swap_fee * 100 / NOMADEX_FEE_SCALE, self.platform_fee() * 100 / NOMADEX_FEE_SCALE
 
     def _mimir_tokens(self, pool_id: int) -> list[dict] | None:
         if not self.mimir_url:
@@ -294,26 +298,36 @@ class Nomadex:
             tokens.append({"id": tid, "kind": kind, "symbol": str(t.get("symbol") or ""), "decimals": decimals})
         return tokens
 
+    @staticmethod
+    def _state_tokens(state: dict) -> list[dict] | None:
+        """Pair from the pool's own global state: alpha_id/alpha_type and beta_id/beta_type."""
+        tokens = []
+        for side in ("alpha", "beta"):
+            tid = state_uint(state.get(f"{side}_id"))
+            if tid is None:
+                return None
+            ttype = state_uint(state.get(f"{side}_type"))
+            kind = NOMADEX_TOKEN_TYPES.get(ttype, "unknown")
+            if tid == 0:
+                kind = "native"
+            tokens.append({"id": tid, "kind": kind, "symbol": "", "decimals": None})
+        return tokens
+
     def tokens(self, pool_id: int, state: dict) -> tuple[list[dict], str]:
-        """The pool's two tokens and where they came from ("mimir", "state" or "unknown")."""
+        """The pool's two tokens and where they came from ("state", "mimir" or "unknown")."""
+        tokens = self._state_tokens(state)
+        if tokens:
+            return tokens, "state"
         tokens = self._mimir_tokens(pool_id)
         if tokens:
             return tokens, "mimir"
-        ids = []
-        for keys in self.TOKEN_KEYS:
-            found = next((state[k] for k in keys if isinstance(state.get(k), int)), None)
-            if found is None:
-                return [], "unknown"
-            ids.append(found)
-        # Type unknown from state alone; the scanner probes ARC-200 and checks ASAs/native itself.
-        return [{"id": i, "kind": "native" if i == 0 else "unknown", "symbol": "", "decimals": None}
-                for i in ids], "state"
+        return [], "unknown"
 
 
 class Scanner:
     def __init__(self, client: indexer.IndexerClient, inactive_days: int, min_units: float,
                  arc200: Arc200Reader | None, arc200_ids: list[int], discover: bool,
-                 nomadex: Nomadex | None = None):
+                 nomadex: Nomadex | None = None, last_seen: bool = True):
         self.client = client
         self.inactive_days = inactive_days
         self.min_units = min_units
@@ -321,6 +335,7 @@ class Scanner:
         self.arc200_ids = arc200_ids
         self.discover = discover
         self.nomadex = nomadex
+        self.last_seen = last_seen
         self._asset_cache: dict[int, dict] = {}
         self._app_exists: dict[int, bool] = {}
 
@@ -349,6 +364,34 @@ class Scanner:
                     raise
                 self._app_exists[app_id] = False
         return self._app_exists[app_id]
+
+    def _first_app_call(self, app_id: int, start: datetime, end: datetime, limit: int = 1) -> list[dict]:
+        res = call(self.client.search_transactions, application_id=app_id,
+                   start_time=iso(start), end_time=iso(end), limit=limit)
+        return res.get("transactions", [])
+
+    def last_app_call(self, app_id: int, lo: datetime, hi: datetime) -> dict | None:
+        """Latest app call in [lo, hi), or None. The indexer only lists oldest-first, so
+        bisect on time with bounded queries (~12 requests) instead of paging all history."""
+        found = self._first_app_call(app_id, lo, hi)
+        if not found:
+            return None
+        best = found[0]
+        lo = datetime.fromtimestamp(best["round-time"], timezone.utc)
+        while hi - lo > timedelta(hours=1):
+            mid = lo + (hi - lo) / 2
+            found = self._first_app_call(app_id, mid, hi)
+            if found:
+                best = found[0]
+                lo = datetime.fromtimestamp(best["round-time"], timezone.utc)
+            else:
+                hi = mid
+        # Under an hour left: list it and take the newest.
+        for t in self._first_app_call(app_id, lo, hi + timedelta(seconds=1), limit=1000):
+            if t.get("confirmed-round", 0) >= best.get("confirmed-round", 0):
+                best = t
+        return {"round": best.get("confirmed-round"),
+                "time": iso(datetime.fromtimestamp(best["round-time"], timezone.utc))}
 
     def arc200_holdings(self, app: dict, escrow: str, extra_ids: list[int] = ()) -> list[dict]:
         token_ids = list(self.arc200_ids)
@@ -391,23 +434,16 @@ class Scanner:
             return None
 
         state = decode_global_state(app)
-        dex_info: dict = {}
-        nomadex_arc200: list[int] = []
+        pair: list[dict] = []
+        pair_source = None
+        fees = None
         if self.nomadex and self.nomadex.is_pool(state):
-            tokens, source = self.nomadex.tokens(app_id, state)
-            fee = self.nomadex.fee_percent(state)
-            dex_info = {"dex": "nomadex", "pair_source": source,
-                        "pair": [{"id": t["id"], "kind": t["kind"], "symbol": t["symbol"]} for t in tokens]}
-            if fee is not None:
-                dex_info["fee_percent"] = round(fee, 6)
-            pair = " / ".join(f"{t['symbol'] or t['id']} ({t['kind']})" for t in tokens) or "pair unknown"
-            fee_txt = f", fee {fee:.4g}%" if fee is not None else ""
-            print(f"  Nomadex pool: {pair} [via {source}]{fee_txt}")
-            for t in tokens:
-                if t["kind"] in ("arc200", "unknown") and t["id"] != 0:
-                    nomadex_arc200.append(t["id"])
-                    if t["kind"] == "arc200" and self.arc200 and t["symbol"] and t["decimals"] is not None:
-                        self.arc200.seed(t["id"], t["symbol"], t["decimals"])
+            pair, pair_source = self.nomadex.tokens(app_id, state)
+            fees = self.nomadex.fees_percent(state)
+            for t in pair:
+                if t["kind"] == "arc200" and self.arc200 and t["symbol"] and t["decimals"] is not None:
+                    self.arc200.seed(t["id"], t["symbol"], t["decimals"])
+        pair_arc200 = [t["id"] for t in pair if t["kind"] in ("arc200", "unknown") and t["id"] != 0]
 
         # 2) Native + ASA balances held by the application account
         try:
@@ -433,7 +469,7 @@ class Scanner:
         arc200_note = None
         if self.arc200:
             try:
-                holdings += self.arc200_holdings(app, escrow, nomadex_arc200)
+                holdings += self.arc200_holdings(app, escrow, pair_arc200)
             except SimulateSenderError as e:
                 arc200_note = "escrow can't fund a simulated call; pass --sim-sender <funded address>"
                 print(f"  ARC-200 skipped: {arc200_note} ({e})")
@@ -441,42 +477,71 @@ class Scanner:
                 arc200_note = f"ARC-200 lookup failed: {e}"
                 print(f"  {arc200_note}")
 
-        significant = [h for h in holdings if h["amount"] / (10 ** h["decimals"]) >= self.min_units]
-        if not significant:
+        # Pair tokens are always shown (a drained side is the interesting part), even at 0.
+        held = {(h["kind"], h["id"]) for h in holdings}
+        for t in pair:
+            if t["kind"] == "asa" and ("asa", t["id"]) not in held:
+                meta = self.asset_meta(t["id"])
+                holdings.append({"kind": "asa", "id": t["id"], "amount": 0,
+                                 "decimals": meta["decimals"], "unit": meta["unit"]})
+        pair_keys = set()
+        for t in pair:
+            match = next((h for h in holdings if h["id"] == t["id"] and
+                          (t["kind"] == "unknown" or h["kind"] == t["kind"])), None)
+            if match:
+                pair_keys.add((match["kind"], match["id"]))
+                t["kind"], t["symbol"] = match["kind"], match["unit"]
+
+        def whole(h):
+            return h["amount"] / (10 ** h["decimals"])
+
+        if not any(whole(h) >= self.min_units for h in holdings):
             print("  No significant balances - skip")
             return None
+        shown = [h for h in holdings if whole(h) >= self.min_units or (h["kind"], h["id"]) in pair_keys]
 
-        print(f"  Significant holdings: {len(significant)}")
-        for h in significant:
-            print(f"    {h['kind']:<7} {h['unit']:<10} (id {h['id']}): {fmt_amount(h['amount'], h['decimals'])}")
+        if pair_source:
+            names = " / ".join(f"{t['symbol'] or t['id']} ({t['kind']})" for t in pair) or "pair unknown"
+            fee_txt = (f", fee {fees[0] + fees[1]:.4g}% (swap {fees[0]:.4g}% + platform {fees[1]:.4g}%)"
+                       if fees else "")
+            print(f"  Nomadex pool: {names} [via {pair_source}]{fee_txt}")
+        print(f"  Holdings ({len(shown)}):")
+        for h in shown:
+            tag = "  <- pair" if (h["kind"], h["id"]) in pair_keys else ""
+            print(f"    {h['kind']:<7} {h['unit']:<10} (id {h['id']}): {fmt_amount(h['amount'], h['decimals'])}{tag}")
 
-        # 4) Any app call inside the inactivity window? Use wall-clock time, not round estimates.
-        since = datetime.now(timezone.utc) - timedelta(days=self.inactive_days)
-        txns = call(
-            self.client.search_transactions,
-            application_id=app_id,
-            start_time=since.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            limit=1,
-        )
-        recent = txns.get("transactions", [])
-        inactive = not recent
-
-        if inactive:
-            print(f"  No app calls in last {self.inactive_days}d -> INACTIVE")
+        # 4) Activity: latest app call inside the window; if none, optionally search older history.
+        now = datetime.now(timezone.utc)
+        since = now - timedelta(days=self.inactive_days)
+        last = self.last_app_call(app_id, since, now + timedelta(minutes=1))
+        inactive = last is None
+        if inactive and self.last_seen:
+            try:
+                last = self.last_app_call(app_id, CHAIN_START, since)
+            except Exception as e:
+                print(f"  (older history search failed: {e})")
+        if last:
+            age = (now - datetime.strptime(last["time"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)).days
+            last_txt = f"last app call {last['time'][:16].replace('T', ' ')} UTC (round {last['round']}, {age}d ago)"
         else:
-            t = recent[0]
-            ts = datetime.fromtimestamp(t.get("round-time", 0), timezone.utc)
-            print(f"  Active: app call(s) since {since:%Y-%m-%d} "
-                  f"(e.g. round {t.get('confirmed-round')} at {ts:%Y-%m-%d %H:%M} UTC)")
+            last_txt = "no app calls found" if self.last_seen or not inactive else "last app call not searched"
+        if inactive:
+            print(f"  No app calls in last {self.inactive_days}d -> INACTIVE; {last_txt}")
+        else:
+            print(f"  Active: {last_txt}")
 
         result = {
             "app_id": app_id,
             "escrow": escrow,
             "creator": app.get("params", {}).get("creator"),
-            **dex_info,
-            "balances": significant,
-            "inactive": inactive,
         }
+        if pair_source:
+            result.update({"dex": "nomadex", "pair_source": pair_source,
+                           "pair": [{"id": t["id"], "kind": t["kind"], "symbol": t["symbol"]} for t in pair]})
+            if fees:
+                result.update({"fee_percent": round(fees[0] + fees[1], 6),
+                               "swap_fee_percent": round(fees[0], 6), "platform_fee_percent": round(fees[1], 6)})
+        result.update({"balances": shown, "inactive": inactive, "last_app_call": last})
         if arc200_note:
             result["arc200_note"] = arc200_note
         return result
@@ -503,6 +568,8 @@ def main() -> int:
                    help=f"Nomadex factory app ID (default {NOMADEX_FACTORY})")
     p.add_argument("--mimir", default=MIMIR_URL, help=f"Mimir API for Nomadex token pairs (default {MIMIR_URL})")
     p.add_argument("--no-mimir", action="store_true", help="don't call the Mimir API; use global state only")
+    p.add_argument("--no-last-seen", action="store_true",
+                   help="for inactive pools, don't search older history for the last app call")
     p.add_argument("--json", metavar="FILE", help="write inactive candidates to a JSON file")
     args = p.parse_args()
 
@@ -543,7 +610,8 @@ def main() -> int:
         print("No pools to scan.")
         return 0
 
-    scanner = Scanner(idx, args.days, args.min_units, reader, args.arc200, not args.no_discover, nomadex)
+    scanner = Scanner(idx, args.days, args.min_units, reader, args.arc200, not args.no_discover, nomadex,
+                      last_seen=not args.no_last_seen)
     print(f"Scanning {len(app_ids)} pools (inactive = no app calls in {args.days} days)...")
 
     candidates, errors = [], 0
@@ -568,7 +636,8 @@ def main() -> int:
     for c in candidates:
         units = ", ".join(f"{b['unit']} {fmt_amount(b['amount'], b['decimals'])}" for b in c["balances"])
         tag = " [nomadex]" if c.get("dex") == "nomadex" else ""
-        print(f"  App {c['app_id']}{tag} - {units}")
+        seen = f" | last call {c['last_app_call']['time'][:10]}" if c.get("last_app_call") else ""
+        print(f"  App {c['app_id']}{tag} - {units}{seen}")
 
     if args.json:
         with open(args.json, "w") as f:
