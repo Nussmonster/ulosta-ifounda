@@ -1,0 +1,69 @@
+name: Pool scan
+
+on:
+  schedule:
+    - cron: "17 5 * * *"   # daily 05:17 UTC (runs only from the default branch)
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Inactivity window in days"
+        default: "90"
+      extra_args:
+        description: "Extra scanner arguments, e.g. --arc200 390001 or pool app IDs"
+        default: ""
+  push:
+    paths:
+      - pool_scanner.py
+      - requirements.txt
+      - .github/workflows/pool-scan.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pool-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner
+        env:
+          DAYS: ${{ inputs.days || '90' }}
+          EXTRA_ARGS: ${{ inputs.extra_args || '' }}
+        run: |
+          set -o pipefail
+          mkdir -p results
+          # EXTRA_ARGS is split on whitespace on purpose (multiple flags / IDs).
+          python pool_scanner.py --nomadex --days "$DAYS" $EXTRA_ARGS \
+            --json results/candidates.json 2>&1 | tee results/scan.log
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Pool scan"
+            echo '```'
+            sed -n '/^=====/,$p' results/scan.log 2>/dev/null || echo "no log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pool-scan-${{ github.run_id }}
+          path: results/
+          retention-days: 30

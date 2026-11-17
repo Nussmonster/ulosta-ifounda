@@ -5,7 +5,7 @@ Dead/abandoned DEX pool scanner for Voi (or any AVM chain).
 Read-only: it queries a public indexer, and reads ARC-200 balances by *simulating*
 read-only contract calls on algod. Nothing is signed or submitted.
 
-    pip install "py-algorand-sdk>=2.6"
+    pip install -r requirements.txt
     python pool_scanner.py                          # scan KNOWN_POOLS
     python pool_scanner.py 47166025 47424655        # scan specific app IDs
     python pool_scanner.py --arc200 390001 --days 180 --json out.json
