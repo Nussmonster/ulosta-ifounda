@@ -1,7 +1,7 @@
-name: Account lookup (temporary)
+name: Nomadex probe (temporary)
 on:
   push:
-    paths: [tools/account_lookup.py, .github/workflows/diag.yml]
+    paths: [tools/**, .github/workflows/diag.yml]
 permissions:
   contents: read
 jobs:
@@ -13,4 +13,4 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: "3.12"}
       - run: pip install -r requirements.txt
-      - run: python tools/account_lookup.py nussmonster.voi
+      - run: python tools/nomadex_probe.py
