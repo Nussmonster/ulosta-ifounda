@@ -120,6 +120,19 @@ def build_group(sender, sp, pool_id, lp_amount, res) -> list:
     return txns
 
 
+def as_address(value) -> str | None:
+    """algod JSON gives addresses as strings; accept base64 public keys too."""
+    if not value:
+        return None
+    if encoding.is_valid_address(value):
+        return value
+    try:
+        raw = base64.b64decode(value)
+        return encoding.encode_address(raw) if len(raw) == 32 else None
+    except Exception:
+        return None
+
+
 def payouts(sim: dict, sender: str) -> list[str]:
     """Human-readable list of what the inner transactions send to the sender."""
     sender_pk = encoding.decode_address(sender)
@@ -129,10 +142,9 @@ def payouts(sim: dict, sender: str) -> list[str]:
         for it in inner_list or []:
             txn = it.get("txn", {}).get("txn", {})
             ty = txn.get("type")
-            if ty == "pay" and txn.get("rcv") and encoding.encode_address(base64.b64decode(txn["rcv"])) == sender:
+            if ty == "pay" and as_address(txn.get("rcv")) == sender:
                 out.append(f"{ps.fmt_amount(txn.get('amt', 0), ps.NATIVE_DECIMALS)} VOI")
-            elif ty == "axfer" and txn.get("arcv") and \
-                    encoding.encode_address(base64.b64decode(txn["arcv"])) == sender:
+            elif ty == "axfer" and as_address(txn.get("arcv")) == sender:
                 out.append(f"{txn.get('aamt', 0)} base units of ASA {txn.get('xaid')}")
             elif ty == "appl":
                 args = [base64.b64decode(a) for a in txn.get("apaa", [])]
