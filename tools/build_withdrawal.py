@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import os
 import sys
 
@@ -45,6 +46,8 @@ UA = {"User-Agent": "avm-pool-scanner/1.4"}
 def simulate(client, txns, unnamed: bool) -> dict:
     atc = AtomicTransactionComposer()
     for t in txns:
+        t = copy.deepcopy(t)
+        t.group = None  # the composer assigns the (identical) group ID itself
         atc.add_transaction(TransactionWithSigner(t, EmptySigner()))
     req = SimulateRequest(txn_groups=[], allow_empty_signatures=True, allow_unnamed_resources=unnamed)
     return ps.call(atc.simulate, client, req).simulate_response
@@ -133,7 +136,7 @@ def as_address(value) -> str | None:
         return None
 
 
-def payouts(sim: dict, sender: str) -> list[str]:
+def payouts(sim: dict, sender: str, token_meta=None) -> list[str]:
     """Human-readable list of what the inner transactions send to the sender."""
     sender_pk = encoding.decode_address(sender)
     out = []
@@ -149,7 +152,10 @@ def payouts(sim: dict, sender: str) -> list[str]:
             elif ty == "appl":
                 args = [base64.b64decode(a) for a in txn.get("apaa", [])]
                 if args and args[0] == bytes.fromhex("da7025b9") and len(args) == 3 and args[1] == sender_pk:
-                    out.append(f"{int.from_bytes(args[2], 'big')} base units of ARC-200 app {txn.get('apid')}")
+                    amt, app = int.from_bytes(args[2], "big"), txn.get("apid")
+                    m = token_meta(app) if token_meta else None
+                    out.append(f"{ps.fmt_amount(amt, m['decimals'])} {m['symbol']} (ARC-200 app {app})" if m
+                               else f"{amt} base units of ARC-200 app {app}")
             walk(it.get("inner-txns"))
 
     for r in sim["txn-groups"][0]["txn-results"]:
@@ -211,7 +217,7 @@ def main() -> int:
             continue
         print(f"  verified by simulate: {len(txns)} transaction(s), total fee "
               f"{ps.fmt_amount(sum(t.fee for t in txns), 6)} VOI, valid rounds {sp.first}-{sp.last}")
-        for line in payouts(sim2, sender):
+        for line in payouts(sim2, sender, lambda app: reader.meta(app, sender=sender)):
             print(f"  you receive: {line}")
 
         if not args.dry_run:
