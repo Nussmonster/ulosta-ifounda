@@ -1,11 +1,11 @@
-name: Nomadex probe (temporary)
+name: Withdrawal build (temporary)
 on:
   push:
     paths: [tools/**, .github/workflows/diag.yml]
 permissions:
   contents: read
 jobs:
-  diag:
+  build:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -13,4 +13,11 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: "3.12"}
       - run: pip install -r requirements.txt
-      - run: python tools/nomadex_probe.py
+      # Builds UNSIGNED transactions and verifies them with simulate. Nothing is signed or sent.
+      - run: python tools/build_withdrawal.py nussmonster.voi --out withdrawals
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unsigned-withdrawals-${{ github.run_id }}
+          path: withdrawals/
+          retention-days: 3
