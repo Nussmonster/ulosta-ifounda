@@ -9,12 +9,17 @@ read-only contract calls on algod. Nothing is signed or submitted.
     python pool_scanner.py                          # scan KNOWN_POOLS
     python pool_scanner.py 47166025 47424655        # scan specific app IDs
     python pool_scanner.py --arc200 390001 --days 180 --json out.json
+    python pool_scanner.py --nomadex                # every pool created by the Nomadex factory
 
 Balances checked per pool escrow:
   * native VOI and standard assets (ASAs)        -> from the indexer
   * ARC-200 smart-contract tokens                 -> arc200_balanceOf(escrow) via algod simulate
     Which ARC-200 tokens to check: every ID passed with --arc200, plus (unless --no-discover)
     app IDs found in the pool's global state that answer the ARC-200 interface.
+
+Nomadex pools (global state "factory" == Nomadex factory app) are recognised automatically:
+their token pair is looked up in the Mimir API (falling back to global-state keys), ARC-200 legs
+are read via simulate, and the pair and fee are reported. --nomadex lists all factory pools.
 """
 
 from __future__ import annotations
@@ -24,6 +29,8 @@ import base64
 import json
 import sys
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 
 from algosdk import abi
@@ -37,6 +44,9 @@ from algosdk.v2client.models import SimulateRequest
 INDEXER_URL = "https://mainnet-idx.voi.nodely.dev"
 ALGOD_URL = "https://mainnet-api.voi.nodely.dev"
 API_TOKEN = ""  # empty for the public Nodely free tier
+NOMADEX_FACTORY = 411751  # Nomadex factory app on Voi mainnet
+MIMIR_URL = "https://voi-mainnet-mimirapi.nftnavigator.xyz"
+NOMADEX_FEE_SCALE = 10 ** 14  # swap_fee / platform_fee are uint256 fractions of 1e14
 
 # Placeholder app IDs -- replace with real pool app IDs from an explorer / pool registry.
 KNOWN_POOLS = [
@@ -129,6 +139,10 @@ class Arc200Reader:
             out.append(r.return_value)
         return out
 
+    def seed(self, app_id: int, symbol: str, decimals: int) -> None:
+        """Pre-fill metadata known from another source (e.g. a DEX API)."""
+        self._meta.setdefault(app_id, {"symbol": symbol, "decimals": decimals})
+
     def meta(self, app_id: int, sender: str) -> dict | None:
         """ARC-200 metadata for app_id, or None if the app doesn't speak ARC-200."""
         if app_id not in self._meta:
@@ -187,15 +201,126 @@ def global_state_app_candidates(app: dict, exclude: int) -> list[int]:
     return seen[:MAX_DISCOVERY_CANDIDATES]
 
 
+def decode_global_state(app: dict) -> dict[str, int | bytes]:
+    """Global state as {key: int | bytes}; keys decoded as UTF-8 where possible."""
+    out: dict[str, int | bytes] = {}
+    for kv in app.get("params", {}).get("global-state", []) or []:
+        raw_key = base64.b64decode(kv.get("key", ""))
+        key = raw_key.decode("utf-8", "replace")
+        v = kv.get("value", {})
+        out[key] = int(v.get("uint", 0)) if v.get("type") == 2 else base64.b64decode(v.get("bytes", ""))
+    return out
+
+
+def state_uint(value) -> int | None:
+    """A global-state value as an integer (uint, or big-endian bytes up to 32 long)."""
+    if isinstance(value, int):
+        return value
+    if isinstance(value, bytes) and 0 < len(value) <= 32:
+        return int.from_bytes(value, "big")
+    return None
+
+
+class Nomadex:
+    """Nomadex-specific lookups: factory pool listing, token pair, fees."""
+
+    TOKEN_KEYS = (("tok_a", "tokA", "token_a", "tokenA", "token0", "token_0"),
+                  ("tok_b", "tokB", "token_b", "tokenB", "token1", "token_1"))
+
+    def __init__(self, client: indexer.IndexerClient, factory: int, mimir_url: str | None):
+        self.client = client
+        self.factory = factory
+        self.mimir_url = mimir_url.rstrip("/") if mimir_url else None
+        self._platform_fee: int | None = None
+        self.mimir_failures = 0
+
+    def is_pool(self, state: dict) -> bool:
+        return state_uint(state.get("factory")) == self.factory
+
+    def list_pools(self) -> list[int]:
+        """Every live app created by the factory whose state points back at the factory."""
+        creator = get_application_address(self.factory)
+        pools, next_page = [], None
+        while True:
+            res = call(self.client.search_applications, creator=creator, limit=1000, next_page=next_page)
+            for app in res.get("applications", []):
+                if not app.get("deleted") and self.is_pool(decode_global_state(app)):
+                    pools.append(app["id"])
+            next_page = res.get("next-token")
+            if not next_page or not res.get("applications"):
+                return sorted(pools)
+
+    def platform_fee(self) -> int:
+        if self._platform_fee is None:
+            try:
+                app = call(self.client.applications, self.factory)["application"]
+                self._platform_fee = state_uint(decode_global_state(app).get("platform_fee")) or 0
+            except Exception:
+                self._platform_fee = 0
+        return self._platform_fee
+
+    def fee_percent(self, state: dict) -> float | None:
+        swap_fee = state_uint(state.get("swap_fee"))
+        if swap_fee is None:
+            return None
+        return (swap_fee + self.platform_fee()) * 100 / NOMADEX_FEE_SCALE
+
+    def _mimir_tokens(self, pool_id: int) -> list[dict] | None:
+        if not self.mimir_url:
+            return None
+        url = f"{self.mimir_url}/dex/pools?" + urllib.parse.urlencode({"poolId": pool_id})
+        req = urllib.request.Request(url, headers={"User-Agent": "avm-pool-scanner/1.2"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                pools = json.load(r).get("pools") or []
+        except Exception:
+            self.mimir_failures += 1
+            return None
+        if not pools:
+            return None
+        tokens = []
+        for side in ("tokenA", "tokenB"):
+            t = pools[0].get(side) or {}
+            try:
+                tid = int(t["id"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            kind = str(t.get("type") or "").lower()
+            kind = "native" if tid == 0 or kind in ("voi", "native") else ("arc200" if kind == "arc200" else "asa")
+            try:
+                decimals = int(t.get("decimals"))
+            except (TypeError, ValueError):
+                decimals = None
+            tokens.append({"id": tid, "kind": kind, "symbol": str(t.get("symbol") or ""), "decimals": decimals})
+        return tokens
+
+    def tokens(self, pool_id: int, state: dict) -> tuple[list[dict], str]:
+        """The pool's two tokens and where they came from ("mimir", "state" or "unknown")."""
+        tokens = self._mimir_tokens(pool_id)
+        if tokens:
+            return tokens, "mimir"
+        ids = []
+        for keys in self.TOKEN_KEYS:
+            found = next((state[k] for k in keys if isinstance(state.get(k), int)), None)
+            if found is None:
+                return [], "unknown"
+            ids.append(found)
+        # Type unknown from state alone; the scanner probes ARC-200 and checks ASAs/native itself.
+        return [{"id": i, "kind": "native" if i == 0 else "unknown", "symbol": "", "decimals": None}
+                for i in ids], "state"
+
+
 class Scanner:
     def __init__(self, client: indexer.IndexerClient, inactive_days: int, min_units: float,
-                 arc200: Arc200Reader | None, arc200_ids: list[int], discover: bool):
+                 arc200: Arc200Reader | None, arc200_ids: list[int], discover: bool,
+                 nomadex: Nomadex | None = None):
         self.client = client
         self.inactive_days = inactive_days
         self.min_units = min_units
         self.arc200 = arc200
         self.arc200_ids = arc200_ids
         self.discover = discover
+        self.nomadex = nomadex
         self._asset_cache: dict[int, dict] = {}
         self._app_exists: dict[int, bool] = {}
 
@@ -225,8 +350,11 @@ class Scanner:
                 self._app_exists[app_id] = False
         return self._app_exists[app_id]
 
-    def arc200_holdings(self, app: dict, escrow: str) -> list[dict]:
+    def arc200_holdings(self, app: dict, escrow: str, extra_ids: list[int] = ()) -> list[dict]:
         token_ids = list(self.arc200_ids)
+        for t in extra_ids:
+            if t not in token_ids:
+                token_ids.append(t)
         if self.discover:
             for cand in global_state_app_candidates(app, exclude=app["id"]):
                 if cand not in token_ids and self.app_exists(cand):
@@ -262,6 +390,25 @@ class Scanner:
             print("  App is deleted - skip")
             return None
 
+        state = decode_global_state(app)
+        dex_info: dict = {}
+        nomadex_arc200: list[int] = []
+        if self.nomadex and self.nomadex.is_pool(state):
+            tokens, source = self.nomadex.tokens(app_id, state)
+            fee = self.nomadex.fee_percent(state)
+            dex_info = {"dex": "nomadex", "pair_source": source,
+                        "pair": [{"id": t["id"], "kind": t["kind"], "symbol": t["symbol"]} for t in tokens]}
+            if fee is not None:
+                dex_info["fee_percent"] = round(fee, 6)
+            pair = " / ".join(f"{t['symbol'] or t['id']} ({t['kind']})" for t in tokens) or "pair unknown"
+            fee_txt = f", fee {fee:.4g}%" if fee is not None else ""
+            print(f"  Nomadex pool: {pair} [via {source}]{fee_txt}")
+            for t in tokens:
+                if t["kind"] in ("arc200", "unknown") and t["id"] != 0:
+                    nomadex_arc200.append(t["id"])
+                    if t["kind"] == "arc200" and self.arc200 and t["symbol"] and t["decimals"] is not None:
+                        self.arc200.seed(t["id"], t["symbol"], t["decimals"])
+
         # 2) Native + ASA balances held by the application account
         try:
             acct = call(self.client.account_info, escrow)["account"]
@@ -271,7 +418,9 @@ class Scanner:
                 return None
             raise
 
-        holdings = [{"kind": "native", "id": 0, "amount": acct.get("amount", 0),
+        # Native balance above the account's locked minimum balance (this is what a pool can trade).
+        native = max(0, acct.get("amount", 0) - acct.get("min-balance", 0))
+        holdings = [{"kind": "native", "id": 0, "amount": native,
                      "decimals": NATIVE_DECIMALS, "unit": "VOI"}]
         for a in acct.get("assets", []):
             if a.get("deleted"):
@@ -284,7 +433,7 @@ class Scanner:
         arc200_note = None
         if self.arc200:
             try:
-                holdings += self.arc200_holdings(app, escrow)
+                holdings += self.arc200_holdings(app, escrow, nomadex_arc200)
             except SimulateSenderError as e:
                 arc200_note = "escrow can't fund a simulated call; pass --sim-sender <funded address>"
                 print(f"  ARC-200 skipped: {arc200_note} ({e})")
@@ -324,6 +473,7 @@ class Scanner:
             "app_id": app_id,
             "escrow": escrow,
             "creator": app.get("params", {}).get("creator"),
+            **dex_info,
             "balances": significant,
             "inactive": inactive,
         }
@@ -347,11 +497,16 @@ def main() -> int:
     p.add_argument("--no-arc200", action="store_true", help="skip ARC-200 balances entirely")
     p.add_argument("--sim-sender", metavar="ADDRESS",
                    help="funded address used as sender for simulated calls (default: the pool escrow)")
+    p.add_argument("--nomadex", action="store_true",
+                   help="scan every pool created by the Nomadex factory (plus any app IDs given)")
+    p.add_argument("--nomadex-factory", type=int, default=NOMADEX_FACTORY, metavar="APP_ID",
+                   help=f"Nomadex factory app ID (default {NOMADEX_FACTORY})")
+    p.add_argument("--mimir", default=MIMIR_URL, help=f"Mimir API for Nomadex token pairs (default {MIMIR_URL})")
+    p.add_argument("--no-mimir", action="store_true", help="don't call the Mimir API; use global state only")
     p.add_argument("--json", metavar="FILE", help="write inactive candidates to a JSON file")
     args = p.parse_args()
 
-    app_ids = args.app_ids or KNOWN_POOLS
-    headers = {"User-Agent": "avm-pool-scanner/1.1"}
+    headers = {"User-Agent": "avm-pool-scanner/1.2"}
     idx = indexer.IndexerClient(args.token, args.indexer, headers=headers)
 
     try:
@@ -372,7 +527,23 @@ def main() -> int:
             print(f"WARNING: cannot reach algod {args.algod} ({e}); ARC-200 balances will NOT be checked",
                   file=sys.stderr)
 
-    scanner = Scanner(idx, args.days, args.min_units, reader, args.arc200, not args.no_discover)
+    nomadex = Nomadex(idx, args.nomadex_factory, None if args.no_mimir else args.mimir)
+    app_ids = list(args.app_ids)
+    if args.nomadex:
+        try:
+            found = nomadex.list_pools()
+        except Exception as e:
+            print(f"Cannot list Nomadex pools from factory {args.nomadex_factory}: {e}", file=sys.stderr)
+            return 1
+        print(f"Nomadex factory {args.nomadex_factory}: {len(found)} pools")
+        app_ids += [a for a in found if a not in app_ids]
+    elif not app_ids:
+        app_ids = list(KNOWN_POOLS)
+    if not app_ids:
+        print("No pools to scan.")
+        return 0
+
+    scanner = Scanner(idx, args.days, args.min_units, reader, args.arc200, not args.no_discover, nomadex)
     print(f"Scanning {len(app_ids)} pools (inactive = no app calls in {args.days} days)...")
 
     candidates, errors = [], 0
@@ -392,9 +563,12 @@ def main() -> int:
     print(f"Inactive pools with balances: {len(candidates)}  (errors: {errors})")
     if not reader and not args.no_arc200:
         print("  (ARC-200 balances were NOT checked - algod unreachable)")
+    if nomadex.mimir_failures:
+        print(f"  (Mimir API failed {nomadex.mimir_failures}x - those Nomadex pairs came from global state, if at all)")
     for c in candidates:
         units = ", ".join(f"{b['unit']} {fmt_amount(b['amount'], b['decimals'])}" for b in c["balances"])
-        print(f"  App {c['app_id']} - {units}")
+        tag = " [nomadex]" if c.get("dex") == "nomadex" else ""
+        print(f"  App {c['app_id']}{tag} - {units}")
 
     if args.json:
         with open(args.json, "w") as f:
