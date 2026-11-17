@@ -515,16 +515,28 @@ class Scanner:
         since = now - timedelta(days=self.inactive_days)
         last = self.last_app_call(app_id, since, now + timedelta(minutes=1))
         inactive = last is None
+        search_error = None
         if inactive and self.last_seen:
-            try:
-                last = self.last_app_call(app_id, CHAIN_START, since)
-            except Exception as e:
-                print(f"  (older history search failed: {e})")
+            # Walk back in 90-day steps: small bounded queries avoid indexer timeouts (504)
+            # that a single query over the whole history hits.
+            hi = since
+            while hi > CHAIN_START and last is None:
+                lo = max(CHAIN_START, hi - timedelta(days=90))
+                try:
+                    last = self.last_app_call(app_id, lo, hi)
+                except Exception as e:
+                    search_error = f"history search failed between {lo:%Y-%m-%d} and {hi:%Y-%m-%d}: {e}"
+                    break
+                hi = lo
         if last:
             age = (now - datetime.strptime(last["time"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)).days
             last_txt = f"last app call {last['time'][:16].replace('T', ' ')} UTC (round {last['round']}, {age}d ago)"
+        elif search_error:
+            last_txt = f"last app call unknown ({search_error})"
+        elif inactive and not self.last_seen:
+            last_txt = "last app call not searched"
         else:
-            last_txt = "no app calls found" if self.last_seen or not inactive else "last app call not searched"
+            last_txt = "no app calls found"
         if inactive:
             print(f"  No app calls in last {self.inactive_days}d -> INACTIVE; {last_txt}")
         else:
@@ -542,6 +554,8 @@ class Scanner:
                 result.update({"fee_percent": round(fees[0] + fees[1], 6),
                                "swap_fee_percent": round(fees[0], 6), "platform_fee_percent": round(fees[1], 6)})
         result.update({"balances": shown, "inactive": inactive, "last_app_call": last})
+        if search_error:
+            result["last_app_call_error"] = search_error
         if arc200_note:
             result["arc200_note"] = arc200_note
         return result
